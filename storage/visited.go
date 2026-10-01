@@ -13,7 +13,6 @@ func NewVisitedMap() *VisitedMap {
 	}
 }
 
-// TryVisit возвращает true, если URL еще не был посещен, и помечает его как посещенный.
 func (v *VisitedMap) TryVisit(url string) bool {
 	v.mu.Lock()
 	defer v.mu.Unlock()

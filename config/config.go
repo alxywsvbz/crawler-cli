@@ -16,15 +16,19 @@ type Config struct {
 	LogFile        string
 }
 
-func ParseFlags() (*Config, error) {
-	urlsRaw := flag.String("urls", "", "Список URL через запятую")
-	depth := flag.Int("depth", 1, "Максимальная глубина рекурсивного обхода")
-	timeout := flag.Duration("timeout", 2*time.Minute, "Общий таймаут выполнения")
-	reqTimeout := flag.Duration("request-timeout", 10*time.Second, "Таймаут одного HTTP-запроса")
-	output := flag.String("output", "result.json", "Путь к JSON-файлу с результатами")
-	logFile := flag.String("log", "crawler.log", "Путь к файлу логов")
+func ParseFlags(args []string) (*Config, error) {
+	fs := flag.NewFlagSet("crawler-cli", flag.ContinueOnError)
 
-	flag.Parse()
+	urlsRaw := fs.String("urls", "", "Список URL через запятую")
+	depth := fs.Int("depth", 1, "Максимальная глубина рекурсивного обхода")
+	timeout := fs.Duration("timeout", 2*time.Minute, "Общий таймаут выполнения")
+	reqTimeout := fs.Duration("request-timeout", 10*time.Second, "Таймаут одного HTTP-запроса")
+	output := fs.String("output", "result.json", "Путь к JSON-файлу с результатами")
+	logFile := fs.String("log", "crawler.log", "Путь к файлу логов")
+
+	if err := fs.Parse(args); err != nil {
+		return nil, err
+	}
 
 	if *urlsRaw == "" {
 		return nil, fmt.Errorf("параметр --urls не может быть пустым")

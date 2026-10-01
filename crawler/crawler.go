@@ -2,17 +2,16 @@ package crawler
 
 import (
 	"context"
-	"crawler-cli/config"
-	"crawler-cli/parser"
-	"crawler-cli/storage"
-	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"net/url"
-	"os"
 	"strings"
 	"sync"
+
+	"crawler-cli/config"
+	"crawler-cli/parser"
+	"crawler-cli/storage"
 )
 
 type Node struct {
@@ -30,7 +29,6 @@ type Crawler struct {
 }
 
 func NewCrawler(cfg *config.Config, logger *log.Logger) *Crawler {
-	// Настройка HTTP-клиента: запрет автоматических редиректов
 	client := &http.Client{
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
@@ -41,7 +39,7 @@ func NewCrawler(cfg *config.Config, logger *log.Logger) *Crawler {
 		cfg:        cfg,
 		client:     client,
 		visited:    storage.NewVisitedMap(),
-		semaphore:  make(chan struct{}, 10), // Ограничение: максимум 10 одновременных запросов
+		semaphore:  make(chan struct{}, 10), // Максимум 10 одновременно работающих горутин
 		fileLogger: logger,
 	}
 }
@@ -65,13 +63,13 @@ func (c *Crawler) Run(ctx context.Context) ([]*Node, error) {
 				return
 			}
 
-			results[idx] = c.crawlNode(ctx, rawURL, parsedURL.Host, 1)
+			// Корневой обход начинается с глубины 0
+			results[idx] = c.crawlNode(ctx, rawURL, parsedURL.Host, 0)
 		}(i, startURL)
 	}
 
 	wg.Wait()
 
-	// Фильтрация nil элементов (если стартовый URL оказался невалидным или уже посещённым)
 	finalResults := make([]*Node, 0, len(results))
 	for _, res := range results {
 		if res != nil {
@@ -88,17 +86,7 @@ func (c *Crawler) crawlNode(ctx context.Context, currentURL string, allowedHost 
 		Links:    make([]*Node, 0),
 	}
 
-	// Захватом семафора контролируем количество параллельных goroutine на HTTP-запросы
-	select {
-	case <-ctx.Done():
-		c.fileLogger.Printf("[CANCELLED] Context done before fetching %s", currentURL)
-		return node
-	case c.semaphore <- struct{}{}:
-	}
-
 	pageData, err := c.fetchAndParse(ctx, currentURL)
-	<-c.semaphore // Освобождаем слот семафора
-
 	if err != nil {
 		c.fileLogger.Printf("[FETCH ERROR] %s: %v", currentURL, err)
 		return node
@@ -106,7 +94,7 @@ func (c *Crawler) crawlNode(ctx context.Context, currentURL string, allowedHost 
 
 	node.Title = pageData.Title
 
-	// Проверка достижения максимальной глубины
+	// Прекращаем обход дочерних ссылок, если достигли максимальной глубины
 	if currentDepth >= c.cfg.Depth {
 		return node
 	}
@@ -116,23 +104,27 @@ func (c *Crawler) crawlNode(ctx context.Context, currentURL string, allowedHost 
 
 	for _, link := range pageData.Links {
 		parsedLink, err := url.Parse(link)
-		if err != nil {
+		if err != nil || parsedLink.Host != allowedHost {
 			continue
 		}
 
-		// Фильтрация: только ссылки в пределах домена стартового URL
-		if parsedLink.Host != allowedHost {
-			continue
-		}
-
-		// Предотвращение циклов и повторных запросов
 		if !c.visited.TryVisit(link) {
 			continue
+		}
+
+		// Контроль количества горутин: захватываем семафор ПЕРЕД созданием горутины
+		select {
+		case <-ctx.Done():
+			c.fileLogger.Printf("[CANCELLED] Context done before queueing %s", link)
+			return node
+		case c.semaphore <- struct{}{}:
 		}
 
 		wg.Add(1)
 		go func(targetURL string) {
 			defer wg.Done()
+			defer func() { <-c.semaphore }() // Освобождаем семафор по завершении горутины
+
 			childNode := c.crawlNode(ctx, targetURL, allowedHost, currentDepth+1)
 			if childNode != nil {
 				mu.Lock()
@@ -163,7 +155,6 @@ func (c *Crawler) fetchAndParse(ctx context.Context, targetURL string) (*parser.
 
 	c.fileLogger.Printf("[HTTP STATUS] %s -> %d", targetURL, resp.StatusCode)
 
-	// Пропуск редиректов (3xx) и не-OK статусов
 	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
 		return nil, fmt.Errorf("redirect skipped (status %d)", resp.StatusCode)
 	}
@@ -171,7 +162,6 @@ func (c *Crawler) fetchAndParse(ctx context.Context, targetURL string) (*parser.
 		return nil, fmt.Errorf("non-200 status code: %d", resp.StatusCode)
 	}
 
-	// Пропуск не-HTML ресурсов
 	contentType := resp.Header.Get("Content-Type")
 	if !strings.Contains(contentType, "text/html") {
 		return nil, fmt.Errorf("skipped non-HTML content-type: %s", contentType)
@@ -183,16 +173,4 @@ func (c *Crawler) fetchAndParse(ctx context.Context, targetURL string) (*parser.
 	}
 
 	return parser.ExtractPageData(resp.Body, parsedURL)
-}
-
-func SaveJSON(filename string, data interface{}) error {
-	file, err := os.Create(filename)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
-	encoder := json.NewEncoder(file)
-	encoder.SetIndent("", "  ")
-	return encoder.Encode(data)
 }
